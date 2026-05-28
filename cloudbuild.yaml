@@ -1,0 +1,35 @@
+# cloudbuild.yaml
+# Triggered automatically when you push to main branch on GitHub.
+# Builds the Docker image and pushes it to Artifact Registry.
+
+steps:
+  # Build the container image
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - build
+      - -t
+      - us-central1-docker.pkg.dev/$PROJECT_ID/aloe-pm/rentvine-quo-sync:$COMMIT_SHA
+      - -t
+      - us-central1-docker.pkg.dev/$PROJECT_ID/aloe-pm/rentvine-quo-sync:latest
+      - .
+
+  # Push both tags to Artifact Registry
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - push
+      - --all-tags
+      - us-central1-docker.pkg.dev/$PROJECT_ID/aloe-pm/rentvine-quo-sync
+
+  # Update the Cloud Run Job to use the new image
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    entrypoint: gcloud
+    args:
+      - run
+      - jobs
+      - update
+      - rentvine-quo-sync
+      - --image=us-central1-docker.pkg.dev/$PROJECT_ID/aloe-pm/rentvine-quo-sync:$COMMIT_SHA
+      - --region=us-central1
+
+images:
+  - us-central1-docker.pkg.dev/$PROJECT_ID/aloe-pm/rentvine-quo-sync

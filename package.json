@@ -1,0 +1,13 @@
+{
+  "name": "rentvine-quo-sync",
+  "version": "1.0.0",
+  "description": "Sync Rentvine contacts to Quo — runs as a Cloud Run Job",
+  "main": "index.js",
+  "type": "module",
+  "dependencies": {
+    "node-fetch": "^3.3.2"
+  },
+  "scripts": {
+    "start": "node index.js"
+  }
+}
