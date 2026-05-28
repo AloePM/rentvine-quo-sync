@@ -75,7 +75,7 @@ async function upsert(payload) {
   // Look up by externalId
   const findRes = await fetch(
     `${QUO_BASE}/contacts?externalId=${encodeURIComponent(payload.externalId)}`,
-    { headers: { Authorization: QUO_API_KEY } }
+    { headers: { Authorization: `Bearer ${QUO_API_KEY}` } }
   );
   if (!findRes.ok) throw new Error(`Quo lookup: ${findRes.status}`);
   const existing = ((await findRes.json()).data ?? [])[0];
@@ -83,7 +83,7 @@ async function upsert(payload) {
   if (existing) {
     const res = await fetch(`${QUO_BASE}/contacts/${existing.id}`, {
       method: "PATCH",
-      headers: { Authorization: QUO_API_KEY, "Content-Type": "application/json" },
+      headers: { Authorization: `Bearer ${QUO_API_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
     if (!res.ok) throw new Error(`Quo update: ${res.status} – ${await res.text()}`);
@@ -91,7 +91,7 @@ async function upsert(payload) {
   } else {
     const res = await fetch(`${QUO_BASE}/contacts`, {
       method: "POST",
-      headers: { Authorization: QUO_API_KEY, "Content-Type": "application/json" },
+      headers: { Authorization: `Bearer ${QUO_API_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
     if (!res.ok) throw new Error(`Quo create: ${res.status} – ${await res.text()}`);
