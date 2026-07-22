@@ -141,6 +141,18 @@ function buildPayload(c, type, propertyAddress) {
 
 // ─── UPSERT ─────────────────────────────────────────────────────────────────
 
+async function findByPhone(phone) {
+  if (!phone) return null;
+  // Normalize phone to E.164
+  const normalized = phone.replace(/[^+\d]/g, '');
+  const res = await fetch(QUO_BASE + "/contacts?phoneNumber=" + encodeURIComponent(normalized) + "&maxResults=5", { headers: QUO_HEADERS });
+  if (!res.ok) return null;
+  const json = await res.json();
+  const contacts = (json.data ?? []);
+  // Return first contact that matches phone and has no externalId (manually added duplicate)
+  return contacts.find(c => !c.externalId || c.externalId === '') ?? null;
+}
+
 async function upsert(contact, type, propertyAddress) {
   const payload = buildPayload(contact, type, propertyAddress);
   let existing = await findByExternalId(payload.externalId);
@@ -148,6 +160,15 @@ async function upsert(contact, type, propertyAddress) {
   if (existing) {
     await updateContact(existing.id, payload);
     return { action: "updated", matchedBy };
+  }
+  // Fallback: match by phone number to merge duplicates
+  const phone = payload.defaultFields?.phoneNumbers?.[0]?.value;
+  if (phone) {
+    const phoneMatch = await findByPhone(phone);
+    if (phoneMatch) {
+      await updateContact(phoneMatch.id, payload);
+      return { action: "merged", matchedBy: "phone" };
+    }
   }
   await createContact(payload);
   return { action: "created", matchedBy: "none" };
@@ -157,7 +178,7 @@ async function upsert(contact, type, propertyAddress) {
 
 async function main() {
   console.log("Rentvine -> Quo sync starting");
-  const summary = { created: 0, updated: 0, failed: 0 };
+  const summary = { created: 0, updated: 0, merged: 0, failed: 0 };
 
   // Pre-build address maps
   const ownerPropMap  = await buildOwnerPropertyMap();
