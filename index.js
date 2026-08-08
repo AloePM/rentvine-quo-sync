@@ -1,188 +1,177 @@
 import fetch from "node-fetch";
+import fs from "fs";
 
 const RENTVINE_BASE = "https://aloepm.rentvine.com/api/manager";
 const RENTVINE_AUTH = "Basic " + Buffer.from(process.env.RENTVINE_KEY + ":" + process.env.RENTVINE_SECRET).toString("base64");
 const QUO_API_KEY   = process.env.QUO_API_KEY;
 const QUO_BASE      = "https://api.openphone.com/v1";
 const TYPES         = ["owners", "tenants", "vendors", "associations"];
-const ADDR_KEY      = "1711655593845";
+const TAG_KEY       = "1724271238010";
+const PROP_KEYS     = ["6a726c1c0bd9d6a0c43aff2f","6a726c250bd9d6a0c43aff3d","6a726c2b0bd9d6a0c43aff4a","6a726c310bd9d6a0c43aff54","6a726da60bd9d6a0c43aff88","6a726dac0bd9d6a0c43aff8e"];
+const QUO_HEADERS   = { Authorization: QUO_API_KEY, "Content-Type": "application/json" };
+const GCS_BUCKET    = process.env.GCS_BUCKET || "aloe-pm-sync-cache";
+const GCS_CACHE_KEY = "quo-id-cache.json";
 const sleep         = ms => new Promise(r => setTimeout(r, ms));
+let idCache         = {};
 
-// ─── RENTVINE FETCHERS ───────────────────────────────────────────────────────
-
-async function fetchAll(type) {
-  const all = []; let page = 1;
-  console.log("Fetching " + type + "...");
-  while (true) {
-    const res = await fetch(RENTVINE_BASE + "/" + type + "?page=" + page + "&pageSize=250", {
-      headers: { Authorization: RENTVINE_AUTH, Accept: "application/json" }
-    });
-    if (!res.ok) throw new Error("Rentvine " + type + " p" + page + ": " + res.status);
-    const json = await res.json();
-    const rows = (Array.isArray(json) ? json : (json.data ?? [])).map(i => i.contact ?? i);
-    all.push(...rows);
-    console.log("  Page " + page + ": " + rows.length + " (total " + all.length + ")");
-    if (rows.length < 250) break;
-    page++;
+async function loadCache() {
+  try {
+    const { Storage } = await import("@google-cloud/storage");
+    const storage = new Storage();
+    const [contents] = await storage.bucket(GCS_BUCKET).file(GCS_CACHE_KEY).download();
+    idCache = JSON.parse(contents.toString());
+    console.log("Loaded GCS cache: " + Object.keys(idCache).length + " entries");
+  } catch(e) {
+    console.log("No existing cache found, starting fresh");
   }
-  return all;
 }
 
-// Build map of ownerContactID -> [property addresses]
-async function buildOwnerPropertyMap() {
-  console.log("Building owner->property map...");
+async function saveCache() {
+  try {
+    const { Storage } = await import("@google-cloud/storage");
+    const storage = new Storage();
+    await storage.bucket(GCS_BUCKET).file(GCS_CACHE_KEY).save(JSON.stringify(idCache));
+    console.log("Cache saved to GCS: " + Object.keys(idCache).length + " entries");
+  } catch(e) {
+    console.error("Cache save error:", e.message);
+  }
+}
+
+async function rvGet(path) {
+  const res = await fetch(RENTVINE_BASE + path, { headers: { Authorization: RENTVINE_AUTH, Accept: "application/json" } });
+  if (!res.ok) throw new Error("RV " + path + " => " + res.status);
+  return res.json();
+}
+
+// Build owner address map from properties export
+async function buildOwnerAddressMap() {
   const map = {};
+  console.log("Building owner address map...");
   let page = 1;
   while (true) {
-    const res = await fetch(RENTVINE_BASE + "/properties/export?page=" + page + "&pageSize=250", {
-      headers: { Authorization: RENTVINE_AUTH, Accept: "application/json" }
-    });
-    if (!res.ok) break;
-    const json = await res.json();
+    const json = await rvGet("/properties/export?page=" + page + "&pageSize=250");
     const rows = Array.isArray(json) ? json : (json.data ?? []);
     for (const row of rows) {
-      const p = row.property;
-      const owners = row.portfolio?.owners ?? [];
+      const p = row.property ?? {}, port = row.portfolio ?? {};
+      const owners = port.contacts ?? port.owners ?? [];
+      if (p.isActive !== "1") continue;
       const addr = [p.address, p.city, p.stateID, p.postalCode].filter(Boolean).join(", ");
-      for (const owner of owners) {
-        const cid = String(owner.contactID);
+      if (!addr) continue;
+      for (const o of owners) {
+        const cid = String(o.contactID);
         if (!map[cid]) map[cid] = [];
-        if (addr && !map[cid].includes(addr)) map[cid].push(addr);
+        if (!map[cid].includes(addr)) map[cid].push(addr);
       }
     }
     console.log("  Properties page " + page + ": " + rows.length);
     if (rows.length < 250) break;
     page++;
   }
-  console.log("Owner property map built for " + Object.keys(map).length + " owners");
+  console.log("Owner map: " + Object.keys(map).length + " owners");
   return map;
 }
 
-// Build map of tenantContactID -> lease property address
-async function buildTenantPropertyMap() {
-  console.log("Building tenant->property map...");
-  const map = {};
+// Build tenant map from lease export — gets address, email AND phone from lease
+async function buildTenantLeaseMap() {
+  const addrMap    = {}; // contactID -> unit/property address
+  const contactMap = {}; // contactID -> { email, phone }
+  console.log("Building tenant lease map...");
   let page = 1;
   while (true) {
-    const res = await fetch(RENTVINE_BASE + "/leases/export?primaryLeaseStatusIDs[]=2&page=" + page + "&pageSize=250", {
-      headers: { Authorization: RENTVINE_AUTH, Accept: "application/json" }
-    });
-    if (!res.ok) break;
-    const json = await res.json();
-    const rows = Array.isArray(json) ? json : (json.data ?? []);
-    for (const row of rows) {
-      const unit = row.unit;
-      const prop = row.property;
-      const lease = row.lease;
-      const tenants = lease?.tenants ?? [];
-      if (tenants.length === 0) continue;
-      const addr = unit ? [unit.address, unit.city, unit.stateID, unit.postalCode].filter(Boolean).join(", ")
-                        : prop ? [prop.address, prop.city, prop.stateID, prop.postalCode].filter(Boolean).join(", ") : "";
-      for (const tenant of tenants) {
-        if (addr && tenant.contactID) map[String(tenant.contactID)] = addr;
+    const json = await rvGet("/leases/export?primaryLeaseStatusIDs[]=1&primaryLeaseStatusIDs[]=2&primaryLeaseStatusIDs[]=3&page=" + page + "&pageSize=250");
+    const arr = Array.isArray(json) ? json : (json.data ?? []);
+    for (const row of arr) {
+      const u = row.unit, p = row.property;
+      const addr = u ? [u.address, u.city, u.stateID, u.postalCode].filter(Boolean).join(", ")
+                     : p ? [p.address, p.city, p.stateID, p.postalCode].filter(Boolean).join(", ") : "";
+      for (const t of row.lease?.tenants ?? []) {
+        if (!t.contactID) continue;
+        const cid = String(t.contactID);
+        if (addr && !addrMap[cid]) addrMap[cid] = addr;
+        if (!contactMap[cid]) contactMap[cid] = {};
+        if (t.email && !contactMap[cid].email) contactMap[cid].email = t.email;
+        if (t.phone && !contactMap[cid].phone) contactMap[cid].phone = t.phone;
       }
     }
-    console.log("  Leases page " + page + ": " + rows.length);
-    if (rows.length < 250) break;
+    console.log("  Leases page " + page + ": " + arr.length);
+    if (arr.length < 250) break;
     page++;
   }
-  console.log("Tenant property map built for " + Object.keys(map).length + " tenants");
-  return map;
+  console.log("Tenant lease map: " + Object.keys(addrMap).length + " addresses, " + Object.keys(contactMap).length + " contacts");
+  return { addrMap, contactMap };
 }
 
-// ─── QUO ────────────────────────────────────────────────────────────────────
+async function fetchAll(type) {
+  const all = []; let page = 1;
+  console.log("Fetching " + type + "...");
+  while (true) {
+    const json = await rvGet("/" + type + "?page=" + page + "&pageSize=250");
+    const rows = (Array.isArray(json) ? json : (json.data ?? [])).map(i => i.contact ?? i);
+    all.push(...rows); if (rows.length < 250) break; page++;
+  }
+  return all;
+}
 
-const QUO_HEADERS = { Authorization: QUO_API_KEY, "Content-Type": "application/json" };
-
-async function findByExternalId(externalId) {
+async function findInQuo(externalId) {
+  if (idCache[externalId]) return { id: idCache[externalId] };
   const res = await fetch(QUO_BASE + "/contacts?externalIds[]=" + encodeURIComponent(externalId) + "&maxResults=1", { headers: QUO_HEADERS });
   if (!res.ok) return null;
-  const json = await res.json();
-  // Verify exact match since Quo may return partial matches
-  const contacts = (json.data ?? []).filter(c => c.externalId === externalId);
-  return contacts[0] ?? null;
+  const matches = ((await res.json()).data ?? []).filter(c => c.externalId === externalId);
+  if (matches[0]) { idCache[externalId] = matches[0].id; return matches[0]; }
+  return null;
 }
 
-async function createContact(payload) {
-  const res = await fetch(QUO_BASE + "/contacts", { method: "POST", headers: QUO_HEADERS, body: JSON.stringify(payload) });
-  if (!res.ok) throw new Error("create " + res.status + " " + await res.text());
-}
+async function upsertToQuo(contact, type, addresses, leaseContactMap) {
+  const isBiz = type === "vendors" || type === "associations";
+  const hasName = contact.firstName || contact.lastName;
+  const company = (isBiz && !hasName) ? (contact.name || contact.taxPayerName || "") : (contact.taxPayerName || contact.name || "");
+  const role = type[0].toUpperCase() + type.slice(1, -1);
+  const externalId = "rentvine-" + type + "-" + contact.contactID;
 
-async function updateContact(id, payload) {
-  const res = await fetch(QUO_BASE + "/contacts/" + id, { method: "PATCH", headers: QUO_HEADERS, body: JSON.stringify(payload) });
-  if (!res.ok) throw new Error("update " + res.status + " " + await res.text());
-}
+  // For tenants, use lease export email/phone (more complete than contact record)
+  const leaseInfo = (type === "tenants") ? (leaseContactMap[String(contact.contactID)] ?? {}) : {};
+  const email = leaseInfo.email || contact.email;
+  const phone = leaseInfo.phone || contact.phone;
 
-// ─── PAYLOAD ────────────────────────────────────────────────────────────────
+  const customFields = [{ key: TAG_KEY, value: [role] }];
+  for (let i = 0; i < Math.min(addresses.length, PROP_KEYS.length); i++) {
+    customFields.push({ key: PROP_KEYS[i], value: addresses[i] });
+  }
 
-function buildPayload(c, type, propertyAddress) {
-  const role    = type.charAt(0).toUpperCase() + type.slice(1, -1);
-  const isBusinessType = type === "vendors" || type === "associations";
-  const hasPersonName = c.firstName || c.lastName;
-  const company = (isBusinessType && !hasPersonName) ? (c.name || c.taxPayerName || "") : (c.taxPayerName || c.name || "");
-  return {
-    externalId: "rentvine-" + type + "-" + (c.contactID ?? c.id),
-    source: "rentvine",
-    sourceUrl: "https://aloepm.rentvine.com",
+  const payload = {
+    externalId, source: "rentvine", sourceUrl: "https://aloepm.rentvine.com",
     defaultFields: {
-      firstName: (isBusinessType && !hasPersonName) ? company : (c.firstName ?? ""),
-      lastName: (isBusinessType && !hasPersonName) ? "" : (c.lastName ?? ""),
-      role,
-      company: company || null,
-      emails: c.email ? [{ name: "Email", value: c.email }] : [],
-      phoneNumbers: c.phone ? [{ name: "Phone", value: c.phone }] : [],
+      firstName: (isBiz && !hasName) ? company : (contact.firstName ?? ""),
+      lastName:  (isBiz && !hasName) ? "" : (contact.lastName ?? ""),
+      role, company: company || null,
+      emails:       email ? [{ name: "Email", value: email }] : [],
+      phoneNumbers: phone ? [{ name: "Phone", value: phone }] : [],
     },
-    customFields: [
-      ...(propertyAddress ? [{ key: ADDR_KEY, value: propertyAddress }] : []),
-      { key: "1724271238010", value: [role] }
-    ]
+    customFields
   };
-}
 
-// ─── UPSERT ─────────────────────────────────────────────────────────────────
-
-async function findByPhone(phone) {
-  if (!phone) return null;
-  // Normalize phone to E.164
-  const normalized = phone.replace(/[^+\d]/g, '');
-  const res = await fetch(QUO_BASE + "/contacts?phoneNumber=" + encodeURIComponent(normalized) + "&maxResults=5", { headers: QUO_HEADERS });
-  if (!res.ok) return null;
-  const json = await res.json();
-  const contacts = (json.data ?? []);
-  // Return first contact that matches phone and has no externalId (manually added duplicate)
-  return contacts.find(c => !c.externalId || c.externalId === '') ?? null;
-}
-
-async function upsert(contact, type, propertyAddress) {
-  const payload = buildPayload(contact, type, propertyAddress);
-  let existing = await findByExternalId(payload.externalId);
-  let matchedBy = "externalId";
+  const existing = await findInQuo(externalId);
   if (existing) {
-    await updateContact(existing.id, payload);
-    return { action: "updated", matchedBy };
+    const r = await fetch(QUO_BASE + "/contacts/" + existing.id, { method: "PATCH", headers: QUO_HEADERS, body: JSON.stringify(payload) });
+    if (!r.ok) throw new Error("update " + r.status + " " + await r.text());
+    idCache[externalId] = existing.id;
+    return "updated";
   }
-  // Fallback: match by phone number to merge duplicates
-  const phone = payload.defaultFields?.phoneNumbers?.[0]?.value;
-  if (phone) {
-    const phoneMatch = await findByPhone(phone);
-    if (phoneMatch) {
-      await updateContact(phoneMatch.id, payload);
-      return { action: "merged", matchedBy: "phone" };
-    }
-  }
-  await createContact(payload);
-  return { action: "created", matchedBy: "none" };
+  const r = await fetch(QUO_BASE + "/contacts", { method: "POST", headers: QUO_HEADERS, body: JSON.stringify(payload) });
+  if (r.status === 409) return "skipped";
+  if (!r.ok) throw new Error("create " + r.status + " " + await r.text());
+  const created = await r.json();
+  if (created.data?.id) idCache[externalId] = created.data.id;
+  return "created";
 }
-
-// ─── MAIN ───────────────────────────────────────────────────────────────────
 
 async function main() {
   console.log("Rentvine -> Quo sync starting");
-  const summary = { created: 0, updated: 0, merged: 0, failed: 0 };
+  await loadCache();
+  const summary = { created: 0, updated: 0, skipped: 0, failed: 0 };
 
-  // Pre-build address maps
-  const ownerPropMap  = await buildOwnerPropertyMap();
-  const tenantPropMap = await buildTenantPropertyMap();
+  const ownerAddressMap            = await buildOwnerAddressMap();
+  const { addrMap: tenantAddrMap, contactMap: tenantContactMap } = await buildTenantLeaseMap();
 
   for (const type of TYPES) {
     let contacts;
@@ -194,32 +183,26 @@ async function main() {
     for (let i = 0; i < contacts.length; i++) {
       const c = contacts[i];
       const cid = String(c.contactID ?? c.id ?? "");
-
-      // Get property address based on contact type
-      let propertyAddress = "";
-      if (type === "owners") {
-        const addrs = ownerPropMap[cid] ?? [];
-        propertyAddress = addrs.join(" | ");  // multiple properties separated by pipe
-      } else if (type === "tenants") {
-        propertyAddress = tenantPropMap[cid] ?? "";
-      }
+      let addresses = [];
+      if (type === "owners")  addresses = ownerAddressMap[cid] ?? [];
+      if (type === "tenants") { const a = tenantAddrMap[cid]; if (a) addresses = [a]; }
 
       try {
-        const { action, matchedBy } = await upsert(c, type, propertyAddress);
+        const action = await upsertToQuo(c, type, addresses, tenantContactMap);
         summary[action]++;
-      
-        if ((i + 1) % 50 === 0 || i === contacts.length - 1)
-          console.log("  [" + (i+1) + "/" + contacts.length + "] " + action + " by " + matchedBy + (propertyAddress ? " | addr: " + propertyAddress.substring(0,40) : ""));
+        if ((i + 1) % 50 === 0 || i === contacts.length - 1) {
+          console.log("[" + (i+1) + "/" + contacts.length + "] " + action + " rentvine-" + type + "-" + cid + (addresses.length ? " | " + addresses.length + " addr" : ""));
+        }
       } catch (e) {
         summary.failed++;
-        console.error("  FAIL rentvine-" + type + "-" + cid + ": " + e.message);
+        console.error("FAIL rentvine-" + type + "-" + cid + ": " + e.message);
       }
       await sleep(150);
     }
   }
 
-  console.log("SYNC COMPLETE created:" + summary.created + " updated:" + summary.updated + " failed:" + summary.failed);
+  saveCache();
+  console.log("SYNC COMPLETE created:" + summary.created + " updated:" + summary.updated + " skipped:" + summary.skipped + " failed:" + summary.failed + " cache:" + Object.keys(idCache).length);
   process.exit(0);
 }
-
 main().catch(e => { console.error("Fatal:", e); process.exit(1); });
